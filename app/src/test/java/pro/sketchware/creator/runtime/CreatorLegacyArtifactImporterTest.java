@@ -137,6 +137,30 @@ public class CreatorLegacyArtifactImporterTest {
         assertThat(result.getReport().count(CreatorCompatibilityTier.R0_UNSUPPORTED)).isEqualTo(1);
     }
 
+    @Test public void importsSafeMoreBlockReturnArgumentAndUsesItAsTypedReporterValue() {
+        EventBean click = new EventBean(EventBean.EVENT_TYPE_VIEW, 3, "button", "onClick");
+        BlockBean assign = new BlockBean("1", "", "", "setVar");
+        assign.parameters.add("answer");
+        assign.parameters.add("@2");
+        BlockBean call = new BlockBean("2", "echo %s.name", "s", "definedFunc");
+        call.parameters.add("Ada");
+        Map<String, java.util.List<BlockBean>> blocks = new LinkedHashMap<>();
+        blocks.put(click.getEventKey(), Arrays.asList(assign, call));
+
+        BlockBean safeReturn = new BlockBean("1", "", "", "addSourceDirectly");
+        safeReturn.parameters.add("return _name;");
+        MoreBlockCollectionBean definition = new MoreBlockCollectionBean("echo[String]", "echo %s.name",
+                new java.util.ArrayList<>(Collections.singletonList(safeReturn)));
+
+        CreatorLegacyArtifactImporter.Result result = new CreatorLegacyArtifactImporter().importArtifacts(
+                documentWithButton(), Collections.emptyList(), Collections.singletonList(click), blocks,
+                Collections.singletonList(definition));
+        assertThat(result.getReport().count(CreatorCompatibilityTier.R0_UNSUPPORTED)).isEqualTo(0);
+        CreatorRuntimeEngine engine = new CreatorRuntimeEngine(result.getDocument(), 20, new CreatorRuntimeEventLog(20));
+        new CreatorRuntimeExecutor().dispatch(engine, "button", "click");
+        assertThat(engine.getCurrent().getState().get("answer")).isEqualTo("Ada");
+    }
+
     @Test public void importsLegacyValueResourceFamiliesAsTypedVariantMetadata() {
         Map<String, String> values = new LinkedHashMap<>();
         values.put("values/strings.xml", "<resources><string name=\"title\">Creator</string></resources>");

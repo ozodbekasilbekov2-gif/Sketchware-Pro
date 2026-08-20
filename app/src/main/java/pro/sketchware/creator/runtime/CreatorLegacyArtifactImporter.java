@@ -538,6 +538,13 @@ public final class CreatorLegacyArtifactImporter {
         String op = block.opCode.trim().toLowerCase(Locale.ROOT);
         List<String> values = block.parameters == null ? Collections.<String>emptyList() : block.parameters;
         Map<String, Object> payload = new LinkedHashMap<>();
+        if ("addsourcedirectly".equals(op)) {
+            if (values.size() != 1) { unsupported.add(block.opCode); return null; }
+            Map<String, Object> returnExpression = safeMoreBlockReturnExpression(values.get(0));
+            if (returnExpression == null) { unsupported.add(block.opCode); return null; }
+            return new CreatorRuntimeBlock(CreatorRuntimeBlock.Type.CUSTOM_FUNCTION_RETURN,
+                    CreatorRuntimeServiceArguments.output("expression", returnExpression));
+        }
         if ("definedfunc".equals(op)) {
             String functionId = moreBlockId(block.spec);
             if (blank(functionId)) { unsupported.add(block.opCode); return null; }
@@ -1659,6 +1666,25 @@ public final class CreatorLegacyArtifactImporter {
             if (!blank(name)) arguments.add(name);
         }
         return arguments;
+    }
+
+    private static Map<String, Object> safeMoreBlockReturnExpression(String source) {
+        if (source == null) return null;
+        java.util.regex.Matcher matcher = java.util.regex.Pattern
+                .compile("^\\s*return\\s+(.+?)\\s*;\\s*$", java.util.regex.Pattern.DOTALL)
+                .matcher(source);
+        if (!matcher.matches()) return null;
+        String value = matcher.group(1).trim();
+        if (value.matches("_[A-Za-z][A-Za-z0-9_]*")) {
+            return CreatorRuntimeServiceArguments.output("kind", "reporter", "opCode", "getarg",
+                    "spec", value.substring(1), "arguments", Collections.emptyList());
+        }
+        if (value.matches("true|false|-?\\d+(?:\\.\\d+)?")) return literalExpression(value);
+        if (value.length() >= 2 && value.startsWith("\"") && value.endsWith("\"")) {
+            try { return literalExpression(new com.google.gson.Gson().fromJson(value, String.class)); }
+            catch (com.google.gson.JsonSyntaxException ignored) { return null; }
+        }
+        return null;
     }
 
     private static boolean isSound(String source) {

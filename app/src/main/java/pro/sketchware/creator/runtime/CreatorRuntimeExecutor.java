@@ -22,7 +22,7 @@ public final class CreatorRuntimeExecutor {
     }
 
     private final CreatorRuntimeServiceDispatcher runtimeServices;
-    private final Deque<Map<String, Object>> customFunctionFrames = new ArrayDeque<>();
+    private final Deque<CustomFunctionFrame> customFunctionFrames = new ArrayDeque<>();
     private int customFunctionDepth;
 
     public CreatorRuntimeExecutor() { this(null); }
@@ -33,13 +33,16 @@ public final class CreatorRuntimeExecutor {
         CreatorEventBinding binding = findBinding(engine.getCurrent(), targetWidgetId, eventName);
         if (binding == null) return Collections.emptyList();
         List<Effect> effects = new ArrayList<>();
-        if (executeBlocks(engine, binding.getBlocks(), effects) == Flow.BREAK) {
+        Flow completed = executeBlocks(engine, binding.getBlocks(), effects);
+        if (completed == Flow.BREAK) {
             effects.add(new Effect("break", "ignored_outside_loop"));
+        } else if (completed == Flow.RETURN) {
+            effects.add(new Effect("more_block_return", "ignored_outside_more_block"));
         }
         return Collections.unmodifiableList(effects);
     }
 
-    private enum Flow { CONTINUE, BREAK }
+    private enum Flow { CONTINUE, BREAK, RETURN }
 
     private Flow executeBlocks(CreatorRuntimeEngine engine, List<CreatorRuntimeBlock> blocks, List<Effect> effects) {
         for (CreatorRuntimeBlock block : blocks) {
@@ -141,21 +144,30 @@ public final class CreatorRuntimeExecutor {
             } else if (block.getType() == CreatorRuntimeBlock.Type.CUSTOM_FUNCTION_CALL) {
                 invokeMoreBlock(engine, String.valueOf(payload.get("functionId")),
                         expressionValues(payload.get("arguments"), engine), effects);
+            } else if (block.getType() == CreatorRuntimeBlock.Type.CUSTOM_FUNCTION_RETURN) {
+                if (!customFunctionFrames.isEmpty()) {
+                    customFunctionFrames.peek().result = evaluate(payload.get("expression"), engine);
+                    customFunctionFrames.peek().returned = true;
+                    return Flow.RETURN;
+                }
+                effects.add(new Effect("more_block_return", "ignored_outside_more_block"));
             } else if (block.getType() == CreatorRuntimeBlock.Type.IF_STATE_EQUALS) {
                 String stateId = String.valueOf(payload.get("stateId"));
                 Object actual = engine.getCurrent().getState().get(stateId);
                 Object expected = payload.get("equals");
                 boolean matches = expected == null ? actual == null : expected.equals(actual);
-                if (executeBlocks(engine, matches ? block.getThenBlocks() : block.getElseBlocks(), effects) == Flow.BREAK) {
-                    return Flow.BREAK;
+                Flow nested = executeBlocks(engine, matches ? block.getThenBlocks() : block.getElseBlocks(), effects);
+                if (nested != Flow.CONTINUE) {
+                    return nested;
                 }
             } else if (block.getType() == CreatorRuntimeBlock.Type.IF_BOOLEAN) {
                 boolean matches;
                 if (payload.containsKey("expression")) matches = booleanValue(evaluate(payload.get("expression"), engine));
                 else if (payload.containsKey("constant")) matches = Boolean.TRUE.equals(payload.get("constant"));
                 else matches = Boolean.TRUE.equals(engine.getCurrent().getState().get(String.valueOf(payload.get("stateId"))));
-                if (executeBlocks(engine, matches ? block.getThenBlocks() : block.getElseBlocks(), effects) == Flow.BREAK) {
-                    return Flow.BREAK;
+                Flow nested = executeBlocks(engine, matches ? block.getThenBlocks() : block.getElseBlocks(), effects);
+                if (nested != Flow.CONTINUE) {
+                    return nested;
                 }
             } else if (block.getType() == CreatorRuntimeBlock.Type.REPEAT) {
                 long requested = payload.containsKey("countExpression") ? number(evaluate(payload.get("countExpression"), engine))
@@ -165,12 +177,16 @@ public final class CreatorRuntimeExecutor {
                 int count = (int) Math.max(0L, Math.min(MAX_REPEAT_ITERATIONS, requested));
                 if (requested > MAX_REPEAT_ITERATIONS) effects.add(new Effect("repeat", "capped:" + MAX_REPEAT_ITERATIONS));
                 for (int iteration = 0; iteration < count; iteration++) {
-                    if (executeBlocks(engine, block.getThenBlocks(), effects) == Flow.BREAK) break;
+                    Flow nested = executeBlocks(engine, block.getThenBlocks(), effects);
+                    if (nested == Flow.RETURN) return Flow.RETURN;
+                    if (nested == Flow.BREAK) break;
                 }
             } else if (block.getType() == CreatorRuntimeBlock.Type.FOREVER) {
                 boolean broken = false;
                 for (int iteration = 0; iteration < MAX_REPEAT_ITERATIONS; iteration++) {
-                    if (executeBlocks(engine, block.getThenBlocks(), effects) == Flow.BREAK) {
+                    Flow nested = executeBlocks(engine, block.getThenBlocks(), effects);
+                    if (nested == Flow.RETURN) return Flow.RETURN;
+                    if (nested == Flow.BREAK) {
                         broken = true;
                         break;
                     }
@@ -477,11 +493,11 @@ public final class CreatorRuntimeExecutor {
         CreatorEventBinding binding = engine.getCurrent().getEvents().get("legacy_moreblock_" + functionId);
         if (binding == null) return null;
         @SuppressWarnings("unchecked") Map<String, Object> definition = (Map<String, Object>) rawDefinition;
-        Map<String, Object> frame = new LinkedHashMap<>();
+        CustomFunctionFrame frame = new CustomFunctionFrame(defaultArgumentValue(definition.get("returnType")));
         Object rawArguments = definition.get("arguments");
         if (rawArguments instanceof List) {
             List<?> names = (List<?>) rawArguments;
-            for (int i = 0; i < names.size(); i++) frame.put(String.valueOf(names.get(i)),
+            for (int i = 0; i < names.size(); i++) frame.arguments.put(String.valueOf(names.get(i)),
                     i < values.size() ? values.get(i) : defaultArgumentValue(definition.get("returnType")));
         }
         customFunctionDepth++;
@@ -492,7 +508,7 @@ public final class CreatorRuntimeExecutor {
             customFunctionFrames.pop();
             customFunctionDepth--;
         }
-        return null;
+        return frame.result;
     }
 
     @SuppressWarnings("unchecked")
@@ -505,7 +521,7 @@ public final class CreatorRuntimeExecutor {
 
     private Object currentCustomArgument(String name) {
         if (customFunctionFrames.isEmpty()) return null;
-        return customFunctionFrames.peek().get(name == null ? "" : name.trim());
+        return customFunctionFrames.peek().arguments.get(name == null ? "" : name.trim());
     }
 
     private static Object defaultArgumentValue(Object returnType) {
@@ -522,6 +538,13 @@ public final class CreatorRuntimeExecutor {
         if (space >= 0) result = result.substring(0, space);
         int bracket = result.indexOf('[');
         return (bracket >= 0 ? result.substring(0, bracket) : result).trim();
+    }
+
+    private static final class CustomFunctionFrame {
+        final Map<String, Object> arguments = new LinkedHashMap<>();
+        Object result;
+        boolean returned;
+        CustomFunctionFrame(Object fallback) { result = fallback; }
     }
 
     private Object liveWidgetValue(CreatorRuntimeEngine engine, Object widgetId, String action,
